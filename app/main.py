@@ -738,13 +738,6 @@ def regularize_attendance(
             "reason": body.reason.strip(),
             "changes": before_after,
         }
-
-        history_entry = {
-            "at": datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None),
-            "by": body.regularized_by,
-            "reason": body.reason.strip(),
-            "changes": before_after,
-        }
         db.attendance_logs.update_one(
             {"_id": record["_id"]},
             {"$set": changes, "$push": {"history": history_entry}},
