@@ -692,15 +692,11 @@ def regularize_attendance(
         raise HTTPException(status_code=422, detail="Punch-out must be after punch-in")
 
     if "punch_in" in changes or "status" in changes:
-        late_minutes = 0
-        if new_punch_in is not None and new_status in PRESENCE:
-            local_in = new_punch_in.replace(tzinfo=timezone.utc).astimezone(IST)
-            sh, sm = map(int, emp["shift_start"].split(":"))
-            shift_start = local_in.replace(hour=sh, minute=sm, second=0, microsecond=0)
-            mins = int((local_in - shift_start).total_seconds() // 60)
-            if mins > 10:
-                late_minutes = mins
-        changes["late_minutes"] = late_minutes
+        changes["late_minutes"] = (
+            calc_late_minutes(new_punch_in, emp, date)
+            if new_punch_in is not None and new_status in PRESENCE
+            else 0
+        )
 
     if "punch_in" in changes or "punch_out" in changes or "status" in changes:
         if new_punch_in is not None and new_punch_out is not None:
