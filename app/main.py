@@ -325,12 +325,13 @@ def list_employees(
     skip = (page - 1) * page_size
     total = db.employees.count_documents(q)
 
-    items = list(
-        db.employees.find(q, {"_id": 0})
+    items = [
+        serialize(doc)
+        for doc in db.employees.find(q, {"_id": 0})
         .sort("emp_code", 1)
         .skip(skip)
         .limit(page_size)
-    )
+    ]
 
     return {
         "items": items,
