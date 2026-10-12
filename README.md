@@ -1,4 +1,4 @@
-﻿# Employee Attendance & Analytics API
+# Employee Attendance & Analytics API
 
 
 
@@ -10,9 +10,11 @@ A REST API built with Python, FastAPI, and MongoDB for employee management, atte
 
 
 
-\- Python 3.11 or newer
+- Python 3.11 or newer
 
-\- MongoDB 6.0 or newer
+- MongoDB 6.0 or newer
+
+- Docker (optional, if running MongoDB in a container)
 
 
 
@@ -46,7 +48,7 @@ pip install -r requirements.txt
 
 
 
-Create a `.env` file in the project root with your local MongoDB settings:
+Create a `.env` file in the project root:
 
 
 
@@ -54,13 +56,45 @@ Create a `.env` file in the project root with your local MongoDB settings:
 
 MONGO_URI=mongodb://localhost:27017
 
-MONGO_DB=attendance\_db
+MONGO_DB=attendance_db
 
 ```
 
 
 
-Make sure MongoDB is running, then start the API:
+### Start MongoDB
+
+
+
+Make sure MongoDB is running and reachable at the URI in `.env`.
+
+
+
+If you use Docker and do not already have a MongoDB container, you can start one with:
+
+
+
+```powershell
+
+docker run -d --name attendance-mongo -p 27017:27017 -v attendance-data:/data/db mongo:7
+
+```
+
+
+
+If a container named `attendance-mongo` already exists, start it instead:
+
+
+
+```powershell
+
+docker start attendance-mongo
+
+```
+
+
+
+### Start the API
 
 
 
@@ -76,9 +110,9 @@ python -m uvicorn app.main:app --port 8000
 
 
 
-\- Swagger UI: http://127.0.0.1:8000/docs
+- Swagger UI: http://127.0.0.1:8000/docs
 
-\- Health check: http://127.0.0.1:8000/health
+- Health check: http://127.0.0.1:8000/health
 
 
 
@@ -86,21 +120,29 @@ python -m uvicorn app.main:app --port 8000
 
 
 
-\- `app/main.py` - API implementation
+- `app/main.py` - API implementation
 
-\- `requirements.txt` - Python dependencies
+- `requirements.txt` - Python dependencies
 
-\- `openapi.yaml` - API contract
+- `openapi.yaml` - API contract
 
-\- `DATA_MODEL.md` - MongoDB data model
+- `DATA_MODEL.md` - MongoDB data model
 
-\- `REVIEW.md` - Implementation review
+- `REVIEW.md` - Implementation review
 
-\- `DECISIONS.md` - Design decisions
+- `DECISIONS.md` - Design decisions
 
-\- `sample_data/` - Sample employee and attendance data
+- `sample_data/` - Sample employee and attendance data
 
-\- `sample_seed.py` - Sample data loader
+- `sample_seed.py` - Sample data loader
+
+
+
+## Sample data warning
+
+
+
+\*\*Running `python sample_seed.py` deletes the existing documents in the `employees` and `attendance_logs` collections before loading the sample data.\*\* Use a disposable development database, not a database containing data you need to keep.
 
 
 
