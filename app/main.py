@@ -679,6 +679,19 @@ def regularize_attendance(
             else:
                 new_punch_out = stored
 
+    if new_status in {"ABSENT", "LEAVE"}:
+        for field, old_value in (
+            ("punch_in", new_punch_in),
+            ("punch_out", new_punch_out),
+        ):
+            if old_value is not None:
+                changes[field] = None
+                before_after[field] = {
+                    "from": old_value.isoformat(),
+                    "to": None,
+                }
+        new_punch_in = None
+        new_punch_out = None
     if new_status in {"ABSENT", "LEAVE"} and (new_punch_in is not None or new_punch_out is not None):
         raise HTTPException(
             status_code=422,
