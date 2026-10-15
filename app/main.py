@@ -192,10 +192,22 @@ def serialize(value):
     if isinstance(value, datetime):
         return utc_naive_to_ms(value)
     return value
+
+
+def stored_utc(value: datetime) -> datetime:
+    """Interpret MongoDB naive datetimes as UTC."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def calc_late_minutes(punch_in: Optional[datetime], emp: dict, attendance_date: str) -> int:
+    """Calculate whole late minutes after the 10-minute grace period."""
+    if punch_in is None:
+        return 0
+    local = stored_utc(punch_in).astimezone(IST)
     start, _ = shift_bounds(emp, attendance_date)
     elapsed_seconds = (local - start).total_seconds()
-    # Apply the grace period to the exact elapsed duration, then floor the
-    # reported lateness to whole minutes (e.g. 09:40:01 for 09:30 => 10).
     if elapsed_seconds <= 10 * 60:
         return 0
     return max(0, int(elapsed_seconds // 60))
@@ -596,10 +608,28 @@ def regularize_attendance(
             "reason": body.reason.strip(),
             "changes": before_after,
         }
-        db.attendance_logs.update_one(
-            {"_id": record["_id"]},
+        expected = {"_id": record["_id"]}
+        for field in (
+            "status",
+            "punch_in",
+            "punch_out",
+            "late_minutes",
+            "overtime_minutes",
+            "work_hours",
+            "half_day",
+        ):
+            expected[field] = record.get(field)
+
+        update_result = db.attendance_logs.update_one(
+            expected,
             {"$set": changes, "$push": {"history": history_entry}},
         )
+
+        if update_result.modified_count != 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Attendance was changed by another request; reload and retry",
+            )
 
     return serialize(
     db.attendance_logs.find_one(
@@ -1181,13 +1211,14 @@ def explain_endpoint(
             raise HTTPException(422, "emp_code and month are required")
 
         first, last = parse_month(month)
-
+        emp = get_employee(emp_code)
+        first_day = max(first, parse_date(emp["joined_on"], "joined_on"))
         pipeline = [
             {
                 "$match": {
                     "emp_code": emp_code,
                     "date": {
-                        "$gte": first.isoformat(),
+                        "$gte": first_day.isoformat(),
                         "$lte": last.isoformat(),
                     },
                 }
