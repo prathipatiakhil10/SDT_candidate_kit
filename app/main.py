@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.errors import PyMongoError, DuplicateKeyError
-
+from pymongo.errors import DuplicateKeyError
 load_dotenv()
 
 client = MongoClient(
@@ -295,19 +295,25 @@ def health():
 
 # ------------------------------- Attendance ---------------------------------
 
+
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
+    doc = body.model_dump()
+    doc["created_at"] = datetime.now(timezone.utc).replace(
+        microsecond=0, tzinfo=None
+    )
+
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
         raise HTTPException(409, "emp_code already exists")
 
-    doc = body.model_dump()
-    doc["created_at"] = datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None)
-    db.employees.insert_one(doc)
     return serialize(doc)
 
 
 @app.get("/employees")
 def list_employees(
+    emp_code: Optional[str] = None,
     department: Optional[str] = None,
     page: int = 1,
     page_size: int = 20,
@@ -316,9 +322,14 @@ def list_employees(
         raise HTTPException(status_code=422, detail="Page must be at least 1")
 
     if page_size < 1 or page_size > 100:
-        raise HTTPException(status_code=422, detail="Page size must be between 1 and 100")
+        raise HTTPException(
+            status_code=422,
+            detail="Page size must be between 1 and 100",
+        )
 
     q = {}
+    if emp_code:
+        q["emp_code"] = emp_code
     if department:
         q["department"] = department
 
@@ -339,30 +350,6 @@ def list_employees(
         "page": page,
         "page_size": page_size,
     }
-def stored_utc(value):
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
-
-def calc_late_minutes(punch, emp, attendance_date):
-    shift_start = datetime.fromisoformat(
-        f"{attendance_date}T{emp['shift_start']}"
-    ).replace(tzinfo=IST)
-
-    if punch.tzinfo is None:
-        punch = punch.replace(tzinfo=timezone.utc)
-
-    minutes_late = (
-        punch - shift_start.astimezone(timezone.utc)
-    ).total_seconds() / 60
-
-    if minutes_late > 10:
-        return int(minutes_late // 1)
-
-    return 0
-
 
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
@@ -376,6 +363,8 @@ def punch_in(body: PunchInIn):
     # Overnight shifts: early-morning punch-ins before shift end belong to prior shift day.
     if emp["shift_end"] <= emp["shift_start"] and local.strftime("%H:%M") < emp["shift_end"]:
         attendance_date = (local.date() - timedelta(days=1)).isoformat()
+    if attendance_date < emp["joined_on"]:
+        raise HTTPException(422, "Attendance date cannot be before employee joined_on")
     late = calc_late_minutes(punch, emp, attendance_date)
     doc = {
         "emp_code": body.emp_code, "date": attendance_date, "status": status,
@@ -450,157 +439,6 @@ def list_attendance(
     docs = list(db.attendance_logs.find(q, {"_id": 0}).sort([("date", DESCENDING), ("emp_code", ASCENDING)]).skip((page - 1) * page_size).limit(page_size))
     return {"items": serialize(docs), "total": total, "page": page, "page_size": page_size}
 
-    parse_date(date)
-    emp = get_employee(emp_code)
-    rec = get_attendance(emp_code, date)
-    if body.status is None and body.punch_in is None and body.punch_out is None:
-        raise HTTPException(422, "Provide at least one field to correct")
-    status = body.status.upper() if body.status is not None else rec["status"]
-    if status not in ALL_STATUSES:
-        raise HTTPException(422, "Invalid attendance status")
-
-    new_in = ms_to_utc_naive(body.punch_in) if body.punch_in is not None else rec.get("punch_in")
-    new_out = ms_to_utc_naive(body.punch_out) if body.punch_out is not None else rec.get("punch_out")
-    for field, supplied, converted in (("punch_in", body.punch_in, new_in), ("punch_out", body.punch_out, new_out)):
-        if supplied is None or converted is None:
-            continue
-        local_value = stored_utc(converted).astimezone(IST)
-        expected_date = local_value.date()
-        # For overnight shifts, early-morning punches belong to the previous
-        # shift date when they occur before the configured shift end.
-        if emp["shift_end"] <= emp["shift_start"] and local_value.strftime("%H:%M") < emp["shift_end"]:
-            expected_date -= timedelta(days=1)
-        if expected_date.isoformat() != date:
-            raise HTTPException(422, f"{field} must belong to the attendance date in IST")
-    if status in {"ABSENT", "LEAVE"}:
-        if body.punch_in is not None or body.punch_out is not None:
-            raise HTTPException(422, "Do not supply punch timestamps for ABSENT or LEAVE")
-        new_in = new_out = None
-    elif new_in is None:
-        raise HTTPException(422, "Presence attendance requires punch-in")
-    if new_in and new_out:
-        if stored_utc(new_out) <= stored_utc(new_in):
-            raise HTTPException(422, "Punch-out must be after punch-in")
-        if stored_utc(new_out) - stored_utc(new_in) > timedelta(hours=24):
-            raise HTTPException(422, "Punch-out must be within 24 hours of punch-in")
-
-    # The changes object records only explicitly changed fields, using epoch-ms values.
-    audit_changes = {}
-    set_values = {}
-    old_status = rec.get("status")
-    if status != old_status:
-        audit_changes["status"] = {"from": old_status, "to": status}
-        set_values["status"] = status
-    for field, old, new, supplied in (
-        ("punch_in", rec.get("punch_in"), new_in, body.punch_in is not None or status in {"ABSENT", "LEAVE"}),
-        ("punch_out", rec.get("punch_out"), new_out, body.punch_out is not None or status in {"ABSENT", "LEAVE"}),
-    ):
-        if supplied and old != new:
-            audit_changes[field] = {"from": utc_naive_to_ms(old), "to": utc_naive_to_ms(new)}
-            set_values[field] = new
-    if not audit_changes:
-        raise HTTPException(422, "Correction does not change any values")
-
-    # Recalculate all stored derived fields from the final state.
-    set_values["late_minutes"] = calc_late_minutes(new_in, emp, date) if status in PRESENCE else 0
-    work_hours = calc_work_hours(new_in, new_out) if status in PRESENCE else None
-    set_values["work_hours"] = work_hours
-    set_values["overtime_minutes"] = calc_overtime(new_out, emp, date) if status in PRESENCE else 0
-    set_values["half_day"] = bool(work_hours is not None and work_hours < 4.5)
-    history = {
-        "at": datetime.now(UTC).replace(microsecond=0, tzinfo=None),
-        "by": body.regularized_by,
-        "reason": body.reason.strip(),
-        "changes": audit_changes,
-    }
-    # Compare-and-set avoids silently overwriting a concurrent correction.
-    result = db.attendance_logs.update_one(
-        {"_id": rec["_id"], "history": rec.get("history", []), "status": rec.get("status")},
-        {"$set": set_values, "$push": {"history": history}},
-    )
-    if result.modified_count != 1:
-        raise HTTPException(409, "Attendance changed concurrently; retry the correction")
-    return serialize(db.attendance_logs.find_one({"_id": rec["_id"]}, {"_id": 0}))
-
-    pipeline = [
-        {"$match": {"date": {"$gte": start.isoformat(), "$lte": end.isoformat()}}},
-        {"$lookup": {"from": "employees", "localField": "emp_code", "foreignField": "emp_code", "as": "employee"}},
-        {"$unwind": "$employee"},
-        {"$match": {"employee.department": department}},
-        {"$group": {
-            "_id": {"$dateFromString": {"dateString": "$date"}},
-            "present_count": {"$sum": {"$cond": [
-                {"$in": ["$status", list(PRESENCE)]},
-                {"$cond": ["$half_day", 0.5, 1]}, 0
-            ]}},
-            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
-        }},
-        {"$project": {"_id": 0, "date": "$_id", "present_count": 1, "late_count": 1}},
-        {"$densify": {"field": "date", "range": {"step": 1, "unit": "day", "bounds": [datetime.combine(start, time.min), datetime.combine(end + timedelta(days=1), time.min)]}}},
-        {"$set": {
-            "is_working_day": {"$in": [{"$dayOfWeek": "$date"}, [2, 3, 4, 5, 6]]},
-            "present_count": {"$ifNull": ["$present_count", 0]},
-            "late_count": {"$ifNull": ["$late_count", 0]},
-        }},
-        {"$lookup": {
-            "from": "employees",
-            "let": {"day": {"$dateToString": {"date": "$date", "format": "%Y-%m-%d"}}},
-            "pipeline": [
-                {"$match": {"department": department}},
-                {"$match": {"$expr": {"$lte": ["$joined_on", "$$day"]}}},
-                {"$count": "count"},
-            ],
-            "as": "roster",
-        }},
-        {"$set": {"headcount": {"$ifNull": [{"$arrayElemAt": ["$roster.count", 0]}, 0]}}},
-        {"$set": {
-            "attendance_rate": {"$cond": [
-                {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
-                {"$round": [{"$multiply": [{"$divide": ["$present_count", "$headcount"]}, 100]}, 4]},
-                None,
-            ]},
-        }},
-        {"$setWindowFields": {
-            "sortBy": {"date": 1},
-            "output": {"moving_avg_7d": {"$avg": "$attendance_rate", "window": {"documents": [-6, 0]}}},
-        }},
-        {"$sort": {"date": 1}},
-        {"$set": {"date": {"$dateToString": {"date": "$date", "format": "%Y-%m-%d"}}}},
-        {"$project": {"_id": 0, "date": 1, "is_working_day": 1, "headcount": 1,
-                      "present_count": 1, "late_count": 1, "attendance_rate": 1, "moving_avg_7d": 1}},
-    ]
-    rows = list(db.attendance_logs.aggregate(pipeline))
-    # If the range contains no attendance logs, densify has no seed document. Seed only that empty case
-    # with a MongoDB-generated calendar sequence; no Python loop is used for gap filling.
-    if not rows:
-        rows = list(db.employees.aggregate([
-            {"$match": {"department": department}},
-            {"$limit": 1},
-            {"$project": {"_id": 0, "joined_on": 1}},
-            {"$set": {"_calendar": {"$map": {
-                "input": {"$range": [0, (end - start).days + 1]},
-                "as": "n",
-                "in": {"$dateToString": {"date": {"$dateAdd": {"startDate": {"$dateFromString": {"dateString": start.isoformat()}}, "unit": "day", "amount": "$$n"}}, "format": "%Y-%m-%d"}},
-            }}}},
-            {"$unwind": "$_calendar"},
-            {"$project": {"date": "$_calendar"}},
-            {"$lookup": {"from": "employees", "let": {"d": "$date"}, "pipeline": [
-                {"$match": {"department": department}},
-                {"$match": {"$expr": {"$lte": ["$joined_on", "$$d"]}}},
-                {"$count": "count"}], "as": "r"}},
-            {"$set": {"headcount": {"$ifNull": [{"$arrayElemAt": ["$r.count", 0]}, 0]},
-                      "is_working_day": {"$in": [{"$dayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, [2, 3, 4, 5, 6]]},
-                      "present_count": 0, "late_count": 0}},
-            {"$set": {"attendance_rate": {"$cond": [{"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]}, 0.0, None]}}},
-            {"$setWindowFields": {"sortBy": {"date": 1}, "output": {"moving_avg_7d": {"$avg": "$attendance_rate", "window": {"documents": [-6, 0]}}}}},
-            {"$project": {"_id": 0, "date": 1, "is_working_day": 1, "headcount": 1, "present_count": 1, "late_count": 1, "attendance_rate": 1, "moving_avg_7d": 1}},
-            {"$sort": {"date": 1}},
-        ]))
-    for row in rows:
-        for key in ("present_count", "attendance_rate", "moving_avg_7d"):
-            if row.get(key) is not None:
-                row[key] = half_up(row[key], 4)
-    return {"department": department, "from": from_date, "to": to_date, "items": rows}
 
 # ------------------------------- Query plans --------------------------------
 
@@ -661,10 +499,20 @@ def regularize_attendance(
         except (ValueError, OverflowError, OSError):
             raise HTTPException(status_code=422, detail=f"Invalid {field} timestamp")
 
-        if converted.astimezone(IST).date().isoformat() != date:
+        local_value = converted.astimezone(IST)
+        expected_date = local_value.date()
+
+        overnight_shift = emp["shift_end"] <= emp["shift_start"]
+        if overnight_shift:
+            if field == "punch_in" and local_value.strftime("%H:%M") < emp["shift_end"]:
+                expected_date -= timedelta(days=1)
+            elif field == "punch_out" and expected_date == parsed_date + timedelta(days=1):
+                expected_date -= timedelta(days=1)
+
+        if expected_date.isoformat() != date:
             raise HTTPException(
                 status_code=422,
-                detail=f"{field} must fall on the attendance date in IST",
+                detail=f"{field} must belong to the attendance date in IST",
             )
 
         stored = converted.replace(tzinfo=None)
@@ -772,7 +620,7 @@ def employee_monthly(emp_code: str, month: str):
             "$match": {
                 "emp_code": emp_code,
                 "date": {
-                    "$gte": first.isoformat(),
+                    "$gte": first_day.isoformat(),
                     "$lte": last.isoformat()
                 }
             }
@@ -881,6 +729,7 @@ def department_summary(month: str, department: Optional[str] = None):
         {
             "$match": {
                 "employee.joined_on": {"$lte": last.isoformat()},
+                "$expr": {"$gte": ["$date", "$employee.joined_on"]},
                 **(
                     {"employee.department": department}
                     if department is not None else {}
@@ -1286,6 +1135,8 @@ def explain_endpoint(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     status: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
     limit: int = Query(10, ge=1, le=50),
     from_date: Optional[str] = Query(None, alias="from"),
     to_date: Optional[str] = Query(None, alias="to"),
@@ -1296,7 +1147,7 @@ def explain_endpoint(
     if endpoint == "attendance_list":
         start, end = validate_date_range(date_from, date_to)
         q = {}
-        if emp_code:
+        if emp_code is not None:
             q["emp_code"] = emp_code
         if start or end:
             q["date"] = {}
@@ -1304,30 +1155,542 @@ def explain_endpoint(
                 q["date"]["$gte"] = start.isoformat()
             if end:
                 q["date"]["$lte"] = end.isoformat()
-        return db.command("explain", {"find": "attendance_logs", "filter": q, "sort": {"date": -1, "emp_code": 1}, "limit": 20}, verbosity="executionStats")
+        if status is not None:
+            if status not in ALL_STATUSES:
+                raise HTTPException(422, "Invalid attendance status")
+            q["status"] = status
+
+        explain = db.command(
+            "explain",
+            {
+                "find": "attendance_logs",
+                "filter": q,
+                "sort": {"date": -1, "emp_code": 1},
+                "skip": (page - 1) * page_size,
+                "limit": page_size,
+            },
+            verbosity="executionStats",
+        )
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": explain,
+        }
     if endpoint == "employee_monthly":
         if not emp_code or not month:
             raise HTTPException(422, "emp_code and month are required")
+
         first, last = parse_month(month)
-        pipeline = [{"$match": {"emp_code": emp_code, "date": {"$gte": first.isoformat(), "$lte": last.isoformat()}}}, {"$group": {"_id": "$emp_code", "n": {"$sum": 1}}}]
-        return db.command("explain", {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}}, verbosity="executionStats")
+
+        pipeline = [
+            {
+                "$match": {
+                    "emp_code": emp_code,
+                    "date": {
+                        "$gte": first.isoformat(),
+                        "$lte": last.isoformat(),
+                    },
+                }
+            },
+            {
+                "$group": {
+                    "_id": None,
+                    "present_days": {
+                        "$sum": {
+                            "$cond": [
+                                {
+                                    "$and": [
+                                        {"$in": ["$status", list(PRESENCE)]},
+                                        {
+                                            "$in": [
+                                                {
+                                                    "$dayOfWeek": {
+                                                        "$dateFromString": {
+                                                            "dateString": "$date"
+                                                        }
+                                                    }
+                                                },
+                                                [2, 3, 4, 5, 6],
+                                            ]
+                                        },
+                                    ]
+                                },
+                                {"$cond": ["$half_day", 0.5, 1]},
+                                0,
+                            ]
+                        }
+                    },
+                    "leave_days": {
+                        "$sum": {
+                            "$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]
+                        }
+                    },
+                    "late_count": {
+                        "$sum": {
+                            "$cond": [
+                                {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]},
+                                1,
+                                0,
+                            ]
+                        }
+                    },
+                    "total_late_minutes": {
+                        "$sum": {"$ifNull": ["$late_minutes", 0]}
+                    },
+                    "total_overtime_minutes": {
+                        "$sum": {"$ifNull": ["$overtime_minutes", 0]}
+                    },
+                }
+            },
+        ]
+
+        explain = db.command(
+            "explain",
+            {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}},
+            verbosity="executionStats",
+        )
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": explain,
+        }
+
     if endpoint == "department_summary":
         if not month:
             raise HTTPException(422, "month is required")
+
         first, last = parse_month(month)
-        pipeline = [{"$match": {"date": {"$gte": first.isoformat(), "$lte": last.isoformat()}}}, {"$group": {"_id": "$emp_code", "n": {"$sum": 1}}}]
-        return db.command("explain", {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}}, verbosity="executionStats")
+
+        match = {
+            "date": {
+                "$gte": first.isoformat(),
+                "$lte": last.isoformat(),
+            }
+        }
+
+        employee_match = {
+            "employee.joined_on": {"$lte": last.isoformat()}
+        }
+        roster_match = {"joined_on": {"$lte": last.isoformat()}}
+
+        if department is not None:
+            employee_match["employee.department"] = department
+            roster_match["department"] = department
+
+        pipeline = [
+            {"$match": match},
+            {
+                "$lookup": {
+                    "from": "employees",
+                    "localField": "emp_code",
+                    "foreignField": "emp_code",
+                    "as": "employee",
+                }
+            },
+            {"$unwind": "$employee"},
+            {"$match": employee_match},
+            {
+                "$group": {
+                    "_id": "$employee.department",
+                    "present_days": {
+                        "$sum": {
+                            "$cond": [
+                                {
+                                    "$and": [
+                                        {"$in": ["$status", list(PRESENCE)]},
+                                        {
+                                            "$in": [
+                                                {
+                                                    "$dayOfWeek": {
+                                                        "$dateFromString": {
+                                                            "dateString": "$date"
+                                                        }
+                                                    }
+                                                },
+                                                [2, 3, 4, 5, 6],
+                                            ]
+                                        },
+                                    ]
+                                },
+                                {"$cond": ["$half_day", 0.5, 1]},
+                                0,
+                            ]
+                        }
+                    },
+                    "hours_sum": {
+                        "$sum": {
+                            "$cond": [
+                                {
+                                    "$and": [
+                                        {"$in": ["$status", list(PRESENCE)]},
+                                        {"$ne": ["$work_hours", None]},
+                                    ]
+                                },
+                                "$work_hours",
+                                0,
+                            ]
+                        }
+                    },
+                    "hours_count": {
+                        "$sum": {
+                            "$cond": [
+                                {
+                                    "$and": [
+                                        {"$in": ["$status", list(PRESENCE)]},
+                                        {"$ne": ["$work_hours", None]},
+                                    ]
+                                },
+                                1,
+                                0,
+                            ]
+                        }
+                    },
+                    "late_count": {
+                        "$sum": {
+                            "$cond": [
+                                {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]},
+                                1,
+                                0,
+                            ]
+                        }
+                    },
+                    "total_late_minutes": {
+                        "$sum": {"$ifNull": ["$late_minutes", 0]}
+                    },
+                    "leave_count": {
+                        "$sum": {
+                            "$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]
+                        }
+                    },
+                    "on_duty_count": {
+                        "$sum": {
+                            "$cond": [{"$eq": ["$status", "ON_DUTY"]}, 1, 0]
+                        }
+                    },
+                }
+            },
+        ]
+
+        attendance_explain = db.command(
+            "explain",
+            {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            verbosity="executionStats",
+        )
+
+        roster_pipeline = [
+            {"$match": roster_match},
+            {
+                "$group": {
+                    "_id": "$department",
+                    "headcount": {"$sum": 1},
+                }
+            },
+            {"$sort": {"_id": 1}},
+        ]
+
+        roster_explain = db.command(
+            "explain",
+            {
+                "aggregate": "employees",
+                "pipeline": roster_pipeline,
+                "cursor": {},
+            },
+            verbosity="executionStats",
+        )
+
+        return {
+            "endpoint": endpoint,
+            "collection": ["attendance_logs", "employees"],
+            "explain": {
+                "attendance": attendance_explain,
+                "roster": roster_explain,
+            },
+        }
+
     if endpoint == "late_leaderboard":
         if not month:
             raise HTTPException(422, "month is required")
+
         first, last = parse_month(month)
-        pipeline = [{"$match": {"date": {"$gte": first.isoformat(), "$lte": last.isoformat()}, "late_minutes": {"$gt": 0}}}, {"$group": {"_id": "$emp_code", "total": {"$sum": "$late_minutes"}}}, {"$sort": {"total": -1}}]
-        return db.command("explain", {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}}, verbosity="executionStats")
+
+        pipeline = [
+            {
+                "$match": {
+                    "date": {
+                        "$gte": first.isoformat(),
+                        "$lte": last.isoformat(),
+                    },
+                    "late_minutes": {"$gt": 0},
+                }
+            },
+            {
+                "$group": {
+                    "_id": "$emp_code",
+                    "total_late_minutes": {"$sum": "$late_minutes"},
+                    "late_count": {"$sum": 1},
+                }
+            },
+            {
+                "$lookup": {
+                    "from": "employees",
+                    "localField": "_id",
+                    "foreignField": "emp_code",
+                    "as": "employee",
+                }
+            },
+            {"$unwind": "$employee"},
+        ]
+
+        if department is not None:
+            pipeline.append(
+                {"$match": {"employee.department": department}}
+            )
+
+        pipeline += [
+            {
+                "$sort": {
+                    "total_late_minutes": -1,
+                    "_id": 1,
+                }
+            },
+            {
+                "$setWindowFields": {
+                    "sortBy": {"total_late_minutes": -1},
+                    "output": {"rank": {"$rank": {}}},
+                }
+            },
+            {"$match": {"rank": {"$lte": limit}}},
+            {
+                "$project": {
+                    "_id": 0,
+                    "rank": 1,
+                    "emp_code": "$_id",
+                    "name": "$employee.name",
+                    "department": "$employee.department",
+                    "total_late_minutes": 1,
+                    "late_count": 1,
+                }
+            },
+        ]
+
+        explain = db.command(
+            "explain",
+            {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            verbosity="executionStats",
+        )
+
+        return {
+            "endpoint": endpoint,
+            "collection": ["attendance_logs", "employees"],
+            "explain": explain,
+        }
+
+
     if not department or not from_date or not to_date:
         raise HTTPException(422, "department, from, and to are required")
+
     start = parse_date(from_date, "from")
     end = parse_date(to_date, "to")
-    if end < start or (end - start).days > 91:
+
+    if end < start or (end - start).days + 1 > 92:
         raise HTTPException(422, "Invalid department trend date range")
-    pipeline = [{"$match": {"date": {"$gte": start.isoformat(), "$lte": end.isoformat()}}}, {"$sort": {"date": 1}}]
-    return db.command("explain", {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}}, verbosity="executionStats")
+
+    pipeline = [
+        {
+            "$match": {
+                "date": {
+                    "$gte": start.isoformat(),
+                    "$lte": end.isoformat(),
+                }
+            }
+        },
+        {
+            "$lookup": {
+                "from": "employees",
+                "localField": "emp_code",
+                "foreignField": "emp_code",
+                "as": "employee",
+            }
+        },
+        {"$unwind": "$employee"},
+        {"$match": {"employee.department": department}},
+        {
+            "$group": {
+                "_id": {
+                    "$dateFromString": {"dateString": "$date"}
+                },
+                "present_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$in": ["$status", list(PRESENCE)]},
+                            {"$cond": ["$half_day", 0.5, 1]},
+                            0,
+                        ]
+                    }
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$gt": [
+                                    {"$ifNull": ["$late_minutes", 0]},
+                                    0,
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "date": "$_id",
+                "present_count": 1,
+                "late_count": 1,
+            }
+        },
+        {
+            "$densify": {
+                "field": "date",
+                "range": {
+                    "step": 1,
+                    "unit": "day",
+                    "bounds": [
+                        datetime.combine(start, time.min),
+                        datetime.combine(end + timedelta(days=1), time.min),
+                    ],
+                },
+            }
+        },
+        {
+            "$set": {
+                "is_working_day": {
+                    "$in": [{"$dayOfWeek": "$date"}, [2, 3, 4, 5, 6]]
+                },
+                "present_count": {"$ifNull": ["$present_count", 0]},
+                "late_count": {"$ifNull": ["$late_count", 0]},
+            }
+        },
+        {
+            "$lookup": {
+                "from": "employees",
+                "let": {
+                    "day": {
+                        "$dateToString": {
+                            "date": "$date",
+                            "format": "%Y-%m-%d",
+                        }
+                    }
+                },
+                "pipeline": [
+                    {"$match": {"department": department}},
+                    {
+                        "$match": {
+                            "$expr": {"$lte": ["$joined_on", "$$day"]}
+                        }
+                    },
+                    {"$count": "count"},
+                ],
+                "as": "roster",
+            }
+        },
+        {
+            "$set": {
+                "headcount": {
+                    "$ifNull": [{"$arrayElemAt": ["$roster.count", 0]}, 0]
+                }
+            }
+        },
+        {
+            "$set": {
+                "attendance_rate": {
+                    "$cond": [
+                        {
+                            "$and": [
+                                "$is_working_day",
+                                {"$gt": ["$headcount", 0]},
+                            ]
+                        },
+                        {
+                            "$round": [
+                                {
+                                    "$multiply": [
+                                        {
+                                            "$divide": [
+                                                "$present_count",
+                                                "$headcount",
+                                            ]
+                                        },
+                                        100,
+                                    ]
+                                },
+                                4,
+                            ]
+                        },
+                        None,
+                    ]
+                }
+            }
+        },
+        {
+            "$setWindowFields": {
+                "sortBy": {"date": 1},
+                "output": {
+                    "moving_avg_7d": {
+                        "$avg": "$attendance_rate",
+                        "window": {"documents": [-6, 0]},
+                    }
+                },
+            }
+        },
+        {"$sort": {"date": 1}},
+        {
+            "$set": {
+                "date": {
+                    "$dateToString": {
+                        "date": "$date",
+                        "format": "%Y-%m-%d",
+                    }
+                }
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "date": 1,
+                "is_working_day": 1,
+                "headcount": 1,
+                "present_count": 1,
+                "late_count": 1,
+                "attendance_rate": 1,
+                "moving_avg_7d": 1,
+            }
+        },
+    ]
+
+    explain = db.command(
+        "explain",
+        {
+            "aggregate": "attendance_logs",
+            "pipeline": pipeline,
+            "cursor": {},
+        },
+        verbosity="executionStats",
+    )
+
+    return {
+        "endpoint": endpoint,
+        "collection": ["attendance_logs", "employees"],
+        "explain": explain,
+    }

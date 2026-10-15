@@ -9,3 +9,16 @@ __pycache__/
 # Local backup files
 app/main_backup.py
 app/main_before_header_fix.py
+
+# Database dumps and local database files
+*.bson
+*.bson.gz
+*.dump
+*.archive
+*.sql
+*.sqlite
+*.sqlite3
+
+# Local backup files
+*.backup
+*.bak
